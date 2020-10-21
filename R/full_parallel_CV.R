@@ -19,6 +19,7 @@ source("R/Model_fitting_functions.R")
 source("R/Model_visualization_functions.R")
 
 
+set.seed(2)
 
 # DIVIDE INTO TRAINING AND TEST FOLDS FOR MODEL VALIDATION
 k <- 5
