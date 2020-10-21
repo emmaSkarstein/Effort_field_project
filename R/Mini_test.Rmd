@@ -1,0 +1,368 @@
+---
+title: "Mini-version of project (to test that things run)"
+author: "Emma Skarstein"
+date: "October 2020"
+output:
+  html_document:
+    theme: journal
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r}
+library(ggplot2)
+library(sf) # for sf objects
+library(plyr)
+library(dplyr) # for smoother dataframe-manipulation
+library(here) # for cleaner filepath-handling
+library(ggmap) # also for nice maps
+library(maps)
+library(RColorBrewer)
+library(INLA)
+library(PointedSDMs)
+library(sp)
+library(spatstat)
+library(maptools)
+library(reshape2)
+library(rgeos)
+library(fields)
+library(viridis)
+library(colorspace)
+library(patchwork)
+```
+
+## Introduction
+This file runs all the code necessary to recreate the final model proposed in my master's thesis, ["Accounting for spatial bias in citizen science observations of Norwegian freshwater fish by using an effort spatial field"](https://github.com/emmaSkarstein/Citizen_Science_Skarstein_master/blob/master/thesis.pdf). I have included all species observations and covariates in the repository.
+
+Note that this file only covers the final model of my thesis, a large part of the work in the thesis was evaluating and comparing different models on different fish species, but this has been omitted for now because the cross-validation procedure used is very time-consuming.
+
+
+
+## Downloading necessary data 
+I have uploaded all the cleaned data to the "data"-folder, except for the lake polygons which are too large to include on Github. But they are easily available here: 
+
+- **Lake polygons for Norway:** Go to https://bird.unit.no/resources/9b27e8f0-55dd-442c-be73-26781dad94c8/content (click on "Innhold"-tab at the bottom of the page to download only selected sets of lakes). The object name should be Norwegian_lakes.rds, and it should be placed in a "data" folder on the top level (the same level as the R-project).
+
+## Loading Norway map
+```{r, Norway map}
+# MAP ---------------------------------------------------------------------------------------------------------
+norway <- ggplot2::map_data("world", region = "Norway(?!:Svalbard)")
+norway <- setdiff(norway, filter(norway, subregion == "Jan Mayen"))
+Projection <- CRS("+proj=longlat +ellps=WGS84")
+norwayfill <- map("world", "norway", fill=TRUE, plot=FALSE, 
+                  ylim=c(58,72), xlim=c(4,32))
+IDs <- sapply(strsplit(norwayfill$names, ":"), function(x) x[1])
+norway.poly <- map2SpatialPolygons(norwayfill, IDs = IDs, 
+                                   proj4string = Projection)
+```
+
+## Setting up observation and environmental data
+
+Next we load the observations as well as the environmental data.
+
+```{r, loading data and covariates}
+# LOADING DATA AND COVARIATES ---------------------------------------------------------------------------------
+
+# Covariates
+covariateData <- readRDS("../data/environmental_covariates.RDS")
+covariateData <- covariateData[complete.cases(covariateData$decimalLatitude,
+                                              covariateData$decimalLongitude,
+                                              covariateData$area_km2,
+                                              covariateData$HFP),]
+covariateData <- covariateData %>% mutate(log_area = log(area_km2)) %>% 
+  select(-c(ebint, no_vatn_lnr, eb_waterregionID))
+
+head(covariateData)
+
+# Choose from 
+# "decimalLatitude", "decimalLongitude",
+# "area_km2", "perimeter_m", "distance_to_road", 
+# "eurolst_bio10", "catchment_area_km2", "SCI", "HFP"
+Use <- c("decimalLongitude","decimalLatitude", "log_area", #"perimeter_m", 
+         "eurolst_bio10", "SCI")
+
+Covariates <- SpatialPointsDataFrame(coords = covariateData[,c("decimalLongitude","decimalLatitude")],
+                                     data = covariateData[,Use], 
+                                     proj4string = Projection)
+#Covariates@data <- data.frame(apply(Covariates@data, 2, scale))  # scale the covariates
+
+# Observations
+Data_survey_df <- readRDS("../data/survey_clean.rds")
+Data_survey <- SpatialPointsDataFrame(coords = Data_survey_df[,c("decimalLongitude","decimalLatitude")], 
+                                      data = Data_survey_df[,c("occurrenceStatus","species")],
+                                      proj4string = Projection)
+
+Data_artsobs_df <- readRDS("../data/artsobs_clean.rds")
+Data_artsobs <- SpatialPointsDataFrame(coords = Data_artsobs_df[,c("decimalLongitude","decimalLatitude")], 
+                                       data = Data_artsobs_df[,c("occurrenceStatus","species")],
+                                       proj4string = Projection)
+
+
+
+# Separating by species:
+perch_survey_df <- filter(Data_survey_df, grepl('Perca fluviatilis', species))
+trout_survey_df <- filter(Data_survey_df, grepl('Salmo trutta', species))
+char_survey_df <- filter(Data_survey_df, grepl('Salvelinus alpinus', species))
+pike_survey_df <- filter(Data_survey_df, grepl('Esox lucius', species))
+
+perch_artsobs_df <- filter(Data_artsobs_df, grepl('Perca fluviatilis', species))
+trout_artsobs_df <- filter(Data_artsobs_df, grepl('Salmo trutta', species))
+char_artsobs_df <- filter(Data_artsobs_df, grepl('Salvelinus alpinus', species))
+pike_artsobs_df <- filter(Data_artsobs_df, grepl('Esox lucius', species))
+
+
+MakeSpDF <- function(df){
+  Projection <- CRS("+proj=longlat +ellps=WGS84")
+  sp_df <- SpatialPointsDataFrame(coords = df[,c("decimalLongitude","decimalLatitude")], 
+                                  data = df[,c("occurrenceStatus","species")],
+                                  proj4string = Projection)
+  sp_df
+}
+
+perch_survey <- MakeSpDF(perch_survey_df)
+trout_survey <- MakeSpDF(trout_survey_df)
+char_survey <- MakeSpDF(char_survey_df)
+pike_survey <- MakeSpDF(pike_survey_df)
+
+perch_artsobs <- MakeSpDF(perch_artsobs_df)
+trout_artsobs <- MakeSpDF(trout_artsobs_df)
+char_artsobs <- MakeSpDF(char_artsobs_df)
+pike_artsobs <- MakeSpDF(pike_artsobs_df)
+```
+Now we have the covariates in 'Covariates', as well as two types of data sets in 'Data_survey' and 'Data_artsobs'.  
+
+## Stacks!
+
+### Integration stack
+
+The integration stack gives the points in the INLA mesh. We first create this mesh from the Norway-polygon-object:
+
+```{r, make mesh}
+# INTEGRATION STACK --------------------------------------------------------------------------------------------
+Meshpars <- list(cutoff=0.08, max.edge=c(0.6, 3), offset=c(1,1))
+Mesh <- MakeSpatialRegion(data=NULL, bdry=norway.poly, meshpars=Meshpars,
+                          proj = Projection)
+#plot(Mesh$mesh)
+```
+
+And then we can create the actual integration stack:
+
+```{r, integration stack}
+stk.ip <- MakeIntegrationStack(mesh=Mesh$mesh, data=Covariates, 
+                               area=Mesh$w, tag='ip', InclCoords=TRUE)
+```
+
+### Stack for survey data (structured)
+The stack for the structured survey data is made the same way as before, nothing changes here. This corresponds to the predictor
+
+$$
+\hat\alpha_{PA} + \hat\beta_{x}(s) + \hat\xi_1(s),
+$$
+where $\alpha_{PA}$ is the intercept, $\hat\beta_{x}(s)$ is the estimated environmental field and $\hat\xi_1(s)$ is the estimated spatial field.
+
+```{r, structured stack}
+# SURVEY, STRUCTURED STACK ---------------------------------------------------------------------------------------------
+stk.survey <- MakeBinomStack(observs = trout_survey, data = Covariates, 
+                             mesh=Mesh$mesh, presname="occurrenceStatus",  
+                             tag="survey", InclCoords=TRUE)
+# Note that when using 'MakeBinomStack' here, the spatial effect in stk.survey is just called "i", 
+#  while in the unstructured data stack we called the corresponding effect 'shared_field'. 
+
+```
+
+### Stack for citizen science data (unstructured)
+When we get to the unstructured citizen science data, this is where things start to change. Since we want to add a second spatial field here, we can no longer use the function 'MakePointsStack()' from the 'PointedSDM' package. This now corresponds to the predictor
+$$
+\hat\alpha_{PO} + \hat\beta_{x}(s) + \hat\xi_1(s) + \hat\xi_2(s).
+$$
+Note that we now have a different intercept, but the environmental and first spatial field are the same as for the structured data. Then at last we have the second estimated spatial field, $\hat\xi_2(s)$.
+
+```{r, unstructured stack}
+# ARTSOBS, UNSTRUCTURED STACK -------------------------------------------------------------------------------------------
+# Finding the covariates that are closest to the observation points
+NearestCovs_unstr <- GetNearestCovariate(points = trout_artsobs, covs = Covariates)
+NearestCovs_unstr@data[ , "int.artsobs"] <- 1 # add intercept 
+
+# Projector matrix from mesh to unstructured data
+projmat.artsobs <- inla.spde.make.A(mesh = Mesh$mesh, 
+                                    loc = as.matrix(trout_artsobs@coords))
+
+stk.artsobs <- inla.stack(data = list(resp = cbind(rep(1,nrow(NearestCovs_unstr)), NA),
+                                              e = rep(0, nrow(NearestCovs_unstr))),
+                                    A = list(1, projmat.artsobs), 
+                                    tag = "artsobs",
+                                    effects = list(NearestCovs_unstr@data, 
+                                                 list(shared_field = 1:Mesh$mesh$n, 
+                                                      bias_field = 1:Mesh$mesh$n))) # This is for the second spatial field!
+
+```
+
+
+### Prediction stack
+In order to do predictions we make a prediction stack, just the same as before.
+
+```{r, prediction stack}
+# PREDICTIONS ----------------------------------------------------------------------------------------------------------
+Nxy.scale <- 0.1 # use this to change the resolution of the predictions
+Nxy <- round(c(diff(norway.poly@bbox[1,]), diff(norway.poly@bbox[2,]))/Nxy.scale)
+stk.pred <- MakeProjectionGrid(nxy=Nxy, mesh=Mesh$mesh, data=Covariates, 
+                               tag='pred',boundary=norway.poly)
+
+```
+
+
+## Fitting the model
+Then finally we get to the model fitting. Here we need to change the formula to include the second spatial field. 
+
+```{r, constructing formula}
+# CONSTRUCTING FORMULA -------------------------------------------------------------------------------------------------
+
+# First specifying the formula components
+intercepts <- "int.survey + int.artsobs - 1"
+env_effects <- paste(Use, collapse = ' + ')
+spatial_effects <- "f(shared_field, model = mesh.shared) + 
+                    f(i, copy = 'shared_field') + 
+                    f(bias_field, model = mesh.bias)"
+
+Formula <- as.formula(paste(c("resp ~ 0 ", intercepts, env_effects, spatial_effects), 
+                            collapse = " + "))
+```
+
+We create the spde-thingy for each of the spatial fields:
+```{r}
+mesh.shared <- INLA::inla.spde2.pcmatern(Mesh$mesh,
+                                         prior.range = c(10, 0.1),
+                                         #prior.sigma = c(0.5, 0.1)
+                                         prior.sigma = c(0.1, 0.1)
+                                           )
+mesh.bias <- INLA::inla.spde2.pcmatern(Mesh$mesh,
+                                       prior.range = c(10, 0.1),
+                                       prior.sigma = c(0.1, 0.1))
+```
+
+These factor into the final model through the formula:
+```{r}
+Formula
+```
+
+We then fit the model:
+
+```{r, fitting model, cache=TRUE}
+# FITTING MODEL -------------------------------------------------------------------------
+stck <- inla.stack(stk.survey, stk.artsobs, stk.ip, stk.pred$stk)
+ 
+# Fit model including predictions
+mod <- INLA::inla(Formula, family=c('poisson','binomial'),
+            control.family = list(list(link = "log"), list(link = "cloglog")),
+            data=inla.stack.data(stck), verbose=FALSE,
+            control.results=list(return.marginals.random=FALSE,
+                                 return.marginals.predictor=FALSE),
+            control.predictor=list(A=inla.stack.A(stck), link=NULL, compute=TRUE),
+            control.fixed = list(mean=0),
+            Ntrials=inla.stack.data(stck)$Ntrials, E=inla.stack.data(stck)$e,
+            control.compute=list(waic=FALSE, dic=FALSE))
+  
+# For predictions
+id <- inla.stack.index(stck, "pred")$data
+pred <- data.frame(mean=mod$summary.fitted.values$mean[id],
+                  stddev=mod$summary.fitted.values$sd[id])
+  
+model_output <- list(model = mod, predictions = pred)
+```
+
+
+## Results
+
+Looking at the summary of the model:
+
+```{r}
+summary(model_output$model)
+```
+
+For the plots I use some functions found in the file [Model_visualization_functions.R](https://github.com/emmaSkarstein/Citizen_Science_Skarstein_master/blob/master/R/Model_visualization_functions.R).
+
+We can plot the effort field $\hat\xi_2(s)$ and the shared spatial field $\hat\xi_1(s)$ as follows:
+```{r, include=FALSE}
+source("../R/Model_visualization_functions.R", local = knitr::knit_global())
+# or sys.source("your-script.R", envir = knitr::knit_global())
+```
+```{r, plot random fields}
+spat_fields_df <- proj_random_field(model_output$model, sp_polygon = norway.poly, 
+                                    mesh = Mesh$mesh)
+spat_fields <- spat_fields_df %>% tidyr::gather(key = statistic, value = value, mean:sd)
+
+# New labels for statistics variable
+statistic.labs <- c("Mean", "Standard deviation")
+names(statistic.labs) <- c("mean", "sd")
+
+# New labels for field variable
+field.labs <- c("Second spatial field (PO data only)", "First spatial field (both data sets)")  
+names(field.labs) <- c("bias", "shared")
+
+shared_p <- ggplot(spat_fields %>% filter(field == "shared")) +
+  geom_raster(aes(x = decimalLongitude, y = decimalLatitude, fill = value)) +
+  #scale_fill_viridis(option = "magma", direction = -1) +
+  scale_fill_continuous_sequential(palette = "BuPu")  +
+  facet_grid(rows = vars(statistic),
+             labeller = labeller(field = field.labs, statistic = statistic.labs)) +
+  geom_polygon(data = norway, aes(long, lat, group = group), 
+               color="black", fill = NA) + coord_quickmap() + 
+  theme_bw() +
+  theme(axis.title = element_blank(), legend.position = "left",
+        strip.background = element_blank(), strip.text.y = element_blank(),
+        legend.title = element_blank()) +
+  ggtitle(expression(paste("First spatial field, ", xi[1]))) 
+
+bias_p <- ggplot(spat_fields%>% filter(field == "bias")) +
+  geom_raster(aes(x = decimalLongitude, y = decimalLatitude, fill = value)) +
+  #scale_fill_viridis(option = "viridis", direction = -1) +
+  scale_fill_continuous_sequential(palette = "GnBu")  +
+  facet_grid(rows = vars(statistic),
+             labeller = labeller(field = field.labs, statistic = statistic.labs)) +
+  geom_polygon(data = norway, aes(long, lat, group = group), 
+               color="black", fill = NA) + coord_quickmap() + 
+  theme_bw() +
+  theme(axis.title = element_blank(), axis.ticks.y = element_blank(), 
+        axis.text.y = element_blank(), legend.title = element_blank()) + 
+  ggtitle(expression(paste("Effort field, ", xi[2])))
+
+shared_p + bias_p
+```
+
+
+
+
+We can plot the predictions:
+
+```{r, plotting predictions}
+Pred <- prediction_df(stk.pred = stk.pred, model = model_output)
+Pred_mean <- Pred %>% filter(statistic=="mean")
+Pred_sd <- Pred %>% filter(statistic=="stddev")
+p_mean <- ggplot(Pred_mean) +
+  geom_raster(aes(x = decimalLongitude, y = decimalLatitude, fill = value)) +
+  scale_fill_continuous_sequential(palette = "PuBuGn")  +
+  geom_polygon(data = norway, aes(long, lat, group = group), 
+               color='black', fill = NA) + coord_quickmap() +
+  ggtitle(label = "Mean") +
+  labs(fill = element_blank()) + 
+  theme_bw() + theme(axis.title = element_blank(), plot.title = element_text(hjust = 0.5))
+
+p_sd <- ggplot(Pred_sd) +
+  geom_raster(aes(x = decimalLongitude, y = decimalLatitude, fill = value)) +
+  scale_fill_continuous_sequential(palette = "Reds 3")  +
+  geom_polygon(data = norway, aes(long, lat, group = group), 
+               color='black', fill = NA) + coord_quickmap() + 
+  ggtitle(label = "Standard deviation") +
+  labs(fill = element_blank()) +
+  theme_bw() + theme(axis.title = element_blank(), plot.title = element_text(hjust = 0.5))
+
+p_mean + p_sd
+```
+
+
+ 
+
+
