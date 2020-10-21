@@ -2,5 +2,5 @@
 .Rhistory
 .RData
 .Ruserdata
-R/Mini_test_cache
-R/Mini_test_files
+R/Mini_test_cache/
+R/Mini_test_files/
