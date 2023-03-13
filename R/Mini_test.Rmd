@@ -13,6 +13,12 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 ```
 
 ```{r}
+# This used the Bob O'Hara version of PointedSDMs: https://github.com/oharar/PointedSDMs
+devtools::install_github("oharar/PointedSDMs")
+```
+
+
+```{r}
 library(ggplot2)
 library(sf) # for sf objects
 library(plyr)
@@ -143,16 +149,19 @@ The integration stack gives the points in the INLA mesh. We first create this me
 ```{r, make mesh}
 # INTEGRATION STACK --------------------------------------------------------------------------------------------
 Meshpars <- list(cutoff=0.08, max.edge=c(0.6, 3), offset=c(1,1))
-Mesh <- MakeSpatialRegion(data=NULL, bdry=norway.poly, meshpars=Meshpars,
-                          proj = Projection)
+Mesh <- PointedSDMs::MakeSpatialRegion(data=NULL, bdry=norway.poly, 
+                                       meshpars=Meshpars,
+                                       proj = Projection)
 #plot(Mesh$mesh)
 ```
 
 And then we can create the actual integration stack:
 
 ```{r, integration stack}
-stk.ip <- MakeIntegrationStack(mesh=Mesh$mesh, data=Covariates, 
-                               area=Mesh$w, tag='ip', InclCoords=TRUE)
+stk.ip <- PointedSDMs::MakeIntegrationStack(mesh=Mesh$mesh, 
+                                            data=Covariates, 
+                                            area=Mesh$w, 
+                                            tag='ip', InclCoords=TRUE)
 ```
 
 ### Stack for survey data (structured)
